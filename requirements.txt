@@ -1,0 +1,5 @@
+curl_cffi
+requests[socks]
+lxml
+pandas
+fake_useragent
