@@ -8,7 +8,10 @@ PROXY_CONFIG = {
             "protocol": "https",
             "country": "in",
         },
-        "RULE_JSON": {"PARENT": "proxies", "FIELD_KEYS": {"ip": "ip", "port": "port"}},
+        "RULE_JSON": {
+            "PARENT": "proxies",
+            "FIELD_KEYS": {"proxy": "proxy"},
+        },
     },
     "geonix": {
         "URL": "https://free.geonix.com/api/front/main/pagination/filtration",
@@ -19,9 +22,16 @@ PROXY_CONFIG = {
             "proxyProtocols": ["HTTPS"],
             "proxyTypes": [],
         },
-        "HEADERS": {"Content-Type": "application/json"},
+        "HEADERS": {
+            "Content-Type": "application/json",
+        },
         "METHOD": "POST",
-        "RULE_JSON": {"PARENT": "content", "FIELD_KEYS": {"ip": "ip"}},
+        "RULE_JSON": {
+            "PARENT": "content",
+            "FIELD_KEYS": {
+                "ip": "ip",
+            },
+        },
     },
     "geonode": {
         "URL": "https://proxylist.geonode.com/api/proxy-list",
@@ -33,7 +43,13 @@ PROXY_CONFIG = {
             "country": "IN",
             "sort_type": "asc",
         },
-        "RULE_JSON": {"PARENT": "data", "FIELD_KEYS": {"ip": "ip", "port": "port"}},
+        "RULE_JSON": {
+            "PARENT": "data",
+            "FIELD_KEYS": {
+                "ip": "ip",
+                "port": "port",
+            },
+        },
     },
     "proxyfreeonly": {
         "URL": "https://proxyfreeonly.com/api/free-proxy-list",
@@ -44,14 +60,22 @@ PROXY_CONFIG = {
             "sortBy": "lastChecked",
             "sortType": "desc",
         },
-        "RULE_JSON": {"FIELD_KEYS": {"ip": "ip", "port": "port"}},
+        "RULE_JSON": {
+            "FIELD_KEYS": {
+                "ip": "ip",
+                "port": "port",
+            },
+        },
     },
     "freeproxyupdate": {
         "URL": "https://freeproxyupdate.com/india-in/https-ssl",
         "RULE_HTML": {
             "PANDAS": "YES",
             "INDEX": 0,
-            "FIELD_KEYS": {"ip": "IP address", "port": "Port"},
+            "FIELD_KEYS": {
+                "ip": "IP address",
+                "port": "Port",
+            },
         },
     },
     "advanced_name": {
@@ -60,39 +84,79 @@ PROXY_CONFIG = {
             "XPATH": '//table[@id="table_proxies"]/tbody/tr',
             "DECODE": "BASE64",
             "FIELD_KEYS": {
-                "ip": {"XPATH": "./td[2]/@data-ip", "INDEX": 0},
-                "port": {"XPATH": "./td[3]/@data-port", "INDEX": 0},
+                "ip": {
+                    "XPATH": "./td[2]/@data-ip",
+                    "INDEX": 0,
+                },
+                "port": {
+                    "XPATH": "./td[3]/@data-port",
+                    "INDEX": 0,
+                },
             },
         },
     },
     "chillyproxy": {
         "URL": "https://chillyproxy.com/api/tools/free-proxies?protocol=https&country=IN",
-        "RULE_TXT": {"SEP": "\n"},
+        "RULE_TXT": {
+            "SEP": "\n",
+        },
     },
     "free_proxy_list": {
         "URL": "https://free-proxy-list.net/en/",
-        "RULE_HTML": {"XPATH": "//tbody/tr"},
+        "RULE_HTML": {
+            "XPATH": "//tbody/tr",
+        },
         "FIELD_KEYS": {
-            "ip": {"XPATH": "./td", "INDEX": 0, "TEXT": "YES"},
-            "port": {"XPATH": "./td", "INDEX": 1, "TEXT": "YES"},
+            "ip": {
+                "XPATH": "./td",
+                "INDEX": 0,
+                "TEXT": "YES",
+            },
+            "port": {
+                "XPATH": "./td",
+                "INDEX": 1,
+                "TEXT": "YES",
+            },
         },
         "FILTERS": {
             "AND": [
-                {"XPATH": "./td", "INDEX": 2, "VALUE": "IN"},
-                {"XPATH": "./td", "INDEX": 6, "VALUE": "yes"},
-            ]
+                {
+                    "XPATH": "./td",
+                    "INDEX": 2,
+                    "VALUE": "IN",
+                },
+                {
+                    "XPATH": "./td",
+                    "INDEX": 6,
+                    "VALUE": "yes",
+                },
+            ],
         },
     },
     "fineproxy": {
         "URL": "https://fineproxy.org/wp-json/fineproxy/v1/free-proxies/in",
-        "RULE_JSON": {"PARENT": "rows", "FIELD_KEYS": {"ip": "ip", "port": "port"}},
-        "FILTERS": {"CONTAINS": {"KEY": "protos", "VALUE": "HTTPS"}},
+        "RULE_JSON": {
+            "PARENT": "rows",
+            "FIELD_KEYS": {
+                "ip": "ip",
+                "port": "port",
+            },
+        },
+        "FILTERS": {
+            "CONTAINS": {
+                "KEY": "protos",
+                "VALUE": "HTTPS",
+            },
+        },
     },
     "freeproxydb": {
         "URL": "https://freeproxydb.com/api/proxy/search?country=IN&speed=0,60&https=1",
         "RULE_JSON": {
             "PARENT": "data,data",
-            "FIELD_KEYS": {"ip": "ip", "port": "port"},
+            "FIELD_KEYS": {
+                "ip": "ip",
+                "port": "port",
+            },
         },
     },
     "freevpnnode": {
@@ -100,16 +164,27 @@ PROXY_CONFIG = {
         "RULE_HTML": {
             "PANDAS": "YES",
             "INDEX": 0,
-            "FIELD_KEYS": {"ip": "IP Address", "port": "Port"},
+            "FIELD_KEYS": {
+                "ip": "IP Address",
+                "port": "Port",
+            },
         },
-        "FILTERS": {"EQUALS": {"KEY": "Protocols", "VALUE": "https"}},
+        "FILTERS": {
+            "EQUALS": {
+                "KEY": "Protocols",
+                "VALUE": "https",
+            },
+        },
     },
     "freeproxy": {
         "URL": "https://www.freeproxy.world/?type=https&anonymity=&country=IN&speed=&port=",
         "RULE_HTML": {
             "PANDAS": "YES",
             "INDEX": 0,
-            "FIELD_KEYS": {"ip": "IP Address", "port": "Port"},
+            "FIELD_KEYS": {
+                "ip": "IP Address",
+                "port": "Port",
+            },
         },
     },
     "proxyhub": {
@@ -117,7 +192,10 @@ PROXY_CONFIG = {
         "RULE_HTML": {
             "PANDAS": "YES",
             "INDEX": 0,
-            "FIELD_KEYS": {"ip": "IP", "port": "Port"},
+            "FIELD_KEYS": {
+                "ip": "IP",
+                "port": "Port",
+            },
         },
     },
     "proxydb": {
@@ -125,13 +203,25 @@ PROXY_CONFIG = {
         "RULE_HTML": {
             "PANDAS": "YES",
             "INDEX": 0,
-            "FIELD_KEYS": {"ip": "IP", "port": "Port"},
+            "FIELD_KEYS": {
+                "ip": "IP",
+                "port": "Port",
+            },
         },
     },
     "proxifly": {
         "URL": "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/countries/IN/data.json",
-        "RULE_JSON": {"FIELD_KEYS": {"ip": "proxy"}},
-        "FILTERS": {"EQUALS": {"KEY": "https", "VALUE": True}},
+        "RULE_JSON": {
+            "FIELD_KEYS": {
+                "ip": "proxy",
+            },
+        },
+        "FILTERS": {
+            "EQUALS": {
+                "KEY": "https",
+                "VALUE": True,
+            },
+        },
     },
     "proxydaily": {
         "URL": "https://proxy-daily.com/api/serverside/proxies",
@@ -142,27 +232,29 @@ PROXY_CONFIG = {
             "priority": "u=1, i",
             "referer": "https://proxy-daily.com/",
         },
-        "PARAMS": {"length": 50},
-        "RULE_JSON": {"PARENT": "data", "FIELD_KEYS": {"ip": "ip", "port": "port"}},
-        "FILTERS": {
-            "AND": [
-                {"KEY": "protocol", "VALUE": "Https"},
-                {"KEY": "country", "VALUE": "IN"},
-            ]
-        },
-    },
-    "proxyshare": {
-        "URL": "https://www.proxyshare.com/fetch-proxy/free",
         "PARAMS": {
-            "page_size": 10,
-            "page": 1,
-            "country_code": "IN",
-            "protocol": 2,
-            "language": "en-us",
+            "draw": "3",
+            "start": "0",
+            "length": "100",
         },
         "RULE_JSON": {
-            "PARENT": "data,list",
-            "FIELD_KEYS": {"ip": "ip", "port": "port"},
+            "PARENT": "data",
+            "FIELD_KEYS": {
+                "ip": "ip",
+                "port": "port",
+            },
+        },
+        "FILTERS": {
+            "AND": [
+                {
+                    "KEY": "protocol",
+                    "VALUE": "Https",
+                },
+                {
+                    "KEY": "country",
+                    "VALUE": "IN",
+                },
+            ],
         },
     },
     "proxiware": {
@@ -174,17 +266,78 @@ PROXY_CONFIG = {
         },
         "RULE_JSON": {
             "PARENT": "proxies",
-            "FIELD_KEYS": {"ip": "addr", "port": "port"},
+            "FIELD_KEYS": {
+                "ip": "addr",
+                "port": "port",
+            },
         },
     },
     "proxyspace": {
         "URL": "https://proxyspace.pro/https.txt",
-        "RULE_TXT": {"SEP": "\n"},
+        "RULE_TXT": {
+            "SEP": "\n",
+        },
     },
     "roundproxies": {
         "URL": "https://roundproxies.com/api/get-free-proxies/",
-        "PARAMS": {"country": "IN", "protocols": "https"},
-        "RULE_JSON": {"PARENT": "data", "FIELD_KEYS": {"ip": "ip", "port": "port"}},
+        "PARAMS": {
+            "country": "IN",
+            "protocols": "https",
+        },
+        "RULE_JSON": {
+            "PARENT": "data",
+            "FIELD_KEYS": {
+                "ip": "ip",
+                "port": "port",
+            },
+        },
     },
-    "spys_one": {"URL": "https://spys.one/free-proxy-list/IN/", "RULE_HTML": {}},
+    "spys_one": {
+        "URL": "https://spys.one/en/http-proxy-list/IN/",
+        "RULE_HTML": {
+            "PANDAS": "YES",
+            "INDEX": 1,
+            "DATA_START": 2,
+            "SCRIPT": {
+                "REGEX": r'javascript">(.*?);<',
+                "SEP": ";",
+                "ASSIGNMENT": "=",
+            },
+            "FIELDS": {
+                "ip": {
+                    "SOURCE": {
+                        "TYPE": "COLUMN",
+                        "INDEX": 0,
+                    },
+                    "EXTRACT": {
+                        "TYPE": "REGEX",
+                        "PATTERN": (
+                            r"^(\d{1,3}"
+                            r"(?:\.\d{1,3}){3})"
+                        ),
+                        "GROUP": 1,
+                    },
+                },
+                "port": {
+                    "SOURCE": {
+                        "TYPE": "COLUMN",
+                        "INDEX": 0,
+                    },
+                    "EXTRACT": {
+                        "TYPE": "REGEX",
+                        "PATTERN": (
+                            r"^(\d{1,3}"
+                            r"(?:\.\d{1,3}){3})"
+                            r".*?\+(.+?)\)<"
+                        ),
+                        "GROUP": 2,
+                    },
+                    "TRANSFORM": {
+                        "TYPE": "EVAL_EXPRESSION",
+                        "SEP": "+",
+                    },
+                },
+            },
+        },
+    },
 }
