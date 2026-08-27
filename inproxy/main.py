@@ -222,6 +222,7 @@ class Proxy:
             session.close()
 
     def check_working_proxy(self, session, proxy):
+        print(proxy, flush=True)
         if self.stop_event.is_set():
             return None
 
@@ -274,6 +275,10 @@ class Proxy:
         if not data:
             return
 
+        if isinstance(data, (dict, list)):
+            site_config["FORMATTED_DATA"] = data
+            return
+
         try:
             site_config["FORMATTED_DATA"] = json.loads(data)
 
@@ -283,6 +288,19 @@ class Proxy:
     def process_html(self, site_config):
         html_config = site_config.get("RULE_HTML", {})
         html_data = site_config.get("DATA", "")
+
+        if html_data is None:
+            return
+
+        if hasattr(html_data, "xpath"):
+            site_config["FORMATTED_DATA"] = html_data
+            return
+
+        if isinstance(html_data, bytes):
+            html_data = html_data.decode("utf-8", errors="ignore")
+
+        if not isinstance(html_data, str):
+            html_data = str(html_data)
 
         if "XPATH" not in html_config and "FIELDS" not in html_config:
             return
@@ -301,7 +319,10 @@ class Proxy:
         index = html_config.get("INDEX", 0)
 
         try:
-            tables = pd.read_html(StringIO(html_data))
+            if isinstance(html_data, str):
+                tables = pd.read_html(StringIO(html_data))
+            else:
+                tables = pd.read_html(StringIO(str(html_data)))
 
         except Exception:
             return
@@ -386,6 +407,39 @@ class Proxy:
         site_config["SCRIPT_VARS"] = variables
 
         return variables
+
+    def process_csv(self, site_config):
+        csv_config = site_config.get("RULE_CSV", {})
+        data = site_config.get("DATA", "")
+
+        if data is None:
+            return
+
+        try:
+            if isinstance(data, pd.DataFrame):
+                table = data.copy()
+
+            else:
+                table = pd.read_csv(StringIO(str(data)), sep=csv_config.get("SEP", ","))
+
+        except Exception:
+            return
+
+        header_row = csv_config.get("HEADER_ROW")
+        data_start = csv_config.get("DATA_START")
+
+        if header_row is not None:
+            if header_row >= len(table):
+                return
+
+            table.columns = table.iloc[header_row]
+
+        if data_start is not None:
+            table = table.iloc[data_start:].copy()
+
+        table = table.reset_index(drop=True)
+
+        site_config["FORMATTED_DATA"] = json.loads(table.to_json(orient="records"))
 
     def get_generic_source_value(self, record, source):
         source_type = source.get("TYPE", "KEY").upper()
@@ -519,6 +573,7 @@ class Proxy:
             site_config.get("RULE_HTML")
             or site_config.get("RULE_JSON")
             or site_config.get("RULE_TXT")
+            or site_config.get("RULE_CSV")
             or {}
         )
 
@@ -868,6 +923,38 @@ class Proxy:
             if proxy:
                 self.submit_proxy(proxy)
 
+    def extract_csv(self, site_config):
+        csv_config = site_config.get("RULE_CSV", {})
+        formatted_data = site_config.get("FORMATTED_DATA")
+
+        if formatted_data is None:
+            return
+
+        if not isinstance(formatted_data, list):
+            formatted_data = [formatted_data]
+
+        fields = csv_config.get("FIELD_KEYS", {})
+        filters = site_config.get("FILTERS")
+
+        for row in formatted_data:
+            if self.stop_event.is_set():
+                return
+
+            if not isinstance(row, dict):
+                continue
+
+            if filters and not self.check_filters(row, filters):
+                continue
+
+            ip = row.get(fields.get("ip", "ip"))
+            port = row.get(fields.get("port", "port"))
+            proxy = row.get(fields.get("proxy", "proxy"))
+
+            proxy = self.normalize_proxy(ip, port, proxy)
+
+            if proxy:
+                self.submit_proxy(proxy)
+
     @staticmethod
     def decode(text, decode_algo):
         if text is None:
@@ -882,53 +969,93 @@ class Proxy:
 
         return text
 
-    def format_data(self, site_config):
-        if "RULE_JSON" in site_config:
-            rule_json = site_config.get("RULE_JSON", {})
-
-            self.process_json(site_config)
-
-            if "FIELDS" in rule_json:
-                self.extract_generic(site_config)
-
-            else:
-                self.extract_json(site_config)
-
+    def process_rule(self, site_config):
+        if self.stop_event.is_set():
             return
 
-        if "RULE_HTML" in site_config:
-            html_config = site_config.get("RULE_HTML", {})
+        rule_key = next(
+            (key for key in site_config if key.startswith("RULE_")),
+            None,
+        )
 
-            if html_config.get("SCRIPT"):
+        if not rule_key:
+            return
+
+        rule_config = site_config.get(rule_key)
+
+        if not isinstance(rule_config, dict):
+            return
+
+        if rule_key == "RULE_JSON":
+            self.process_json(site_config)
+
+        elif rule_key == "RULE_HTML":
+            if rule_config.get("SCRIPT"):
                 self.process_html_script(site_config)
 
-            if html_config.get("PANDAS") == "YES":
+            if rule_config.get("PANDAS") == "YES":
                 self.process_html_pandas(site_config)
 
             else:
                 self.process_html(site_config)
 
-            if "FIELDS" in html_config:
+        elif rule_key == "RULE_TXT":
+            self.process_text(site_config)
+
+        elif rule_key == "RULE_CSV":
+            self.process_csv(site_config)
+
+        else:
+            return
+
+        nested_rule_key = next(
+            (key for key in rule_config if key.startswith("RULE_")),
+            None,
+        )
+
+        if nested_rule_key:
+            nested_config = deepcopy(site_config)
+
+            nested_config["DATA"] = site_config.get("FORMATTED_DATA")
+            nested_config["FORMATTED_DATA"] = None
+
+            nested_config.pop(rule_key, None)
+
+            nested_config[nested_rule_key] = rule_config[nested_rule_key]
+
+            self.process_rule(nested_config)
+
+            return
+
+        if rule_key == "RULE_JSON":
+            self.extract_json(site_config)
+
+        elif rule_key == "RULE_HTML":
+            if rule_config.get("FIELDS"):
                 self.extract_generic(site_config)
 
-            elif html_config.get("PANDAS") == "YES":
+            elif rule_config.get("PANDAS") == "YES":
                 self.extract_json(site_config)
 
             else:
                 self.extract_html(site_config)
 
-            return
-
-        if "RULE_TXT" in site_config:
-            txt_config = site_config.get("RULE_TXT", {})
-
-            self.process_text(site_config)
-
-            if "FIELDS" in txt_config:
+        elif rule_key == "RULE_TXT":
+            if rule_config.get("FIELDS"):
                 self.extract_generic(site_config)
 
             else:
                 self.extract_txt(site_config)
+
+        elif rule_key == "RULE_CSV":
+            if rule_config.get("FIELDS"):
+                self.extract_generic(site_config)
+
+            else:
+                self.extract_csv(site_config)
+
+    def format_data(self, site_config):
+        self.process_rule(site_config)
 
     def format_config(self, site_config):
         config = deepcopy(site_config)

@@ -340,4 +340,38 @@ PROXY_CONFIG = {
             },
         },
     },
+    "scdn": {
+        "URL": "https://proxy.scdn.io/get_proxies.php",
+        "HEADERS": {
+            "accept": "*/*",
+            "accept-language": "en-GB,en;q=0.7",
+            "dnt": "1",
+            "priority": "u=1, i",
+            "referer": "https://proxy.scdn.io/",
+        },
+        "PARAMS": {
+            "protocol": "HTTPS",
+            "country": "印度",
+            "per_page": "50",
+            "page": "1",
+        },
+        "RULE_JSON": {
+            "PARENT": "table_html",
+            "RULE_HTML": {
+                "XPATH": "//tr",
+                "FIELD_KEYS": {
+                    "ip": {
+                        "XPATH": "./td[1]",
+                        "INDEX": 0,
+                        "TEXT": "YES",
+                    },
+                    "port": {
+                        "XPATH": "./td[2]",
+                        "INDEX": 0,
+                        "TEXT": "YES",
+                    },
+                },
+            },
+        },
+    },
 }
