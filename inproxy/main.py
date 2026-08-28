@@ -222,7 +222,6 @@ class Proxy:
             session.close()
 
     def check_working_proxy(self, session, proxy):
-        print(proxy, flush=True)
         if self.stop_event.is_set():
             return None
 
