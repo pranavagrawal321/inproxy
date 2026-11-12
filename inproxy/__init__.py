@@ -1,3 +1,5 @@
-from .main import Proxy
+__version__ = "0.1.1"
 
-__all__ = ["Proxy"]
+from .main import InProxy
+
+__all__ = ["InProxy"]

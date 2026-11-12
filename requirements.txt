@@ -3,3 +3,5 @@ requests[socks]
 lxml
 pandas
 fake_useragent
+html5lib
+bs4

@@ -1,80 +1,128 @@
-import re
 import ast
-import sys
-import json
 import base64
-import signal
+import json
 import operator
-import pandas as pd
-from lxml import html
-from io import StringIO
-from queue import Queue, Empty
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
+from dataclasses import asdict, dataclass
+from io import StringIO
+from threading import Event, Lock
+from urllib.parse import urlsplit
+
+import pandas as pd
 from curl_cffi import requests
 from fake_useragent import UserAgent
-from threading import Thread, Event, Lock
+from lxml import html
 
 try:
     from config import PROXY_CONFIG
+    from exceptions import InvalidDataTypeException, NoProxyFoundException
 except ImportError:
     from .config import PROXY_CONFIG
+    from .exceptions import InvalidDataTypeException
 
 ua = UserAgent()
 
 
-class NoProxyFoundException(Exception):
-    pass
-
-
+@dataclass
 class Proxy:
-    def __init__(
-        self,
-        source_workers=20,
-        proxy_workers=100,
-        source_timeout=3,
-        proxy_timeout=2,
-    ):
+    ip: str
+    port: int | None = None
+    protocol: str = "http"
+    country: str | None = None
+    country_code: str | None = None
+    state: str | None = None
+    state_code: str | None = None
+    city: str | None = None
+    region: str | None = None
+    continent: str | None = None
+    timezone: str | None = None
+    isp: str | None = None
+    organization: str | None = None
+    asn: int | None = None
+    anonymity: str | None = None
+    latency: float | None = None
+    source: str | None = None
+    continent_code: str | None = None
+    pincode: str | None = None
+
+    @property
+    def proxy(self):
+        protocol = (self.protocol or "http").lower()
+        ip = str(self.ip).strip()
+
+        if ":" in ip and not ip.startswith("["):
+            ip = f"[{ip}]"
+
+        if self.port is None:
+            return f"{protocol}://{ip}"
+
+        return f"{protocol}://{ip}:{self.port}"
+
+    def __str__(self):
+        return self.proxy
+
+    def __repr__(self):
+        return self.proxy
+
+    def to_dict(self):
+        data = asdict(self)
+        data["proxy"] = self.proxy
+        return data
+
+
+class InProxy:
+    _OPERATORS = {
+        ast.Add: operator.add,
+        ast.Sub: operator.sub,
+        ast.Mult: operator.mul,
+        ast.Div: operator.truediv,
+        ast.FloorDiv: operator.floordiv,
+        ast.Mod: operator.mod,
+        ast.Pow: operator.pow,
+        ast.BitXor: operator.xor,
+        ast.LShift: operator.lshift,
+        ast.RShift: operator.rshift,
+        ast.BitOr: operator.or_,
+        ast.BitAnd: operator.and_,
+    }
+
+    _UNARY_OPERATORS = {
+        ast.UAdd: operator.pos,
+        ast.USub: operator.neg,
+        ast.Invert: operator.invert,
+    }
+
+    def __init__(self, source_workers=20, source_timeout=3):
         self._proxy_config = deepcopy(PROXY_CONFIG)
-
-        self.proxy = None
-
-        self.source_workers = source_workers
-        self.proxy_workers = proxy_workers
+        self._source_workers = source_workers
         self.source_timeout = source_timeout
-        self.proxy_timeout = proxy_timeout
-
+        self.output = {}
+        self.output_count = 0
+        self.set_lock = Lock()
+        self.count_lock = Lock()
         self.stop_event = Event()
-        self.result_event = Event()
+        self.count = 0
+        self.filters = {}
 
-        self.validation_queue = Queue(maxsize=proxy_workers * 4)
+    def _normalize_sites(self, sites):
+        if isinstance(sites, str):
+            return [site.lower().strip() for site in sites.split(",") if site.strip()]
 
-        self.seen = set()
-        self.seen_lock = Lock()
+        if isinstance(sites, list):
+            return [site.lower().strip() for site in sites]
 
-        self.proxy_lock = Lock()
+        return list(self._proxy_config.keys())
 
-        self.sources_remaining = 0
-        self.sources_lock = Lock()
+    def _validate_sites(self, sites):
+        unknown = [site for site in sites if site not in self._proxy_config]
 
-        self.source_threads = []
-        self.validation_threads = []
-
-        self.install_signal_handlers()
-
-    def install_signal_handlers(self):
-        signal_handlers = {
-            signal.SIGINT: self.shutdown,
-            signal.SIGTERM: self.shutdown,
-        }
-
-        for signum, handler in signal_handlers.items():
-            signal.signal(signum, handler)
-
-    def shutdown(self, signum=None, frame=None):
-        if self.stop_event.is_set():
-            return
-
-        self.stop_event.set()
+        if unknown:
+            raise InvalidDataTypeException(
+                f"Unknown sources: {unknown}\n"
+                f"Available sources: {list(self._proxy_config.keys())}"
+            )
 
     def make_request(
         self,
@@ -87,21 +135,23 @@ class Proxy:
         proxies=None,
         timeout=None,
     ):
-        if self.stop_event.is_set():
-            return None
-
         try:
-            response = session.request(
-                method=method,
-                url=url,
-                headers=headers or {},
-                params=params or {},
-                json=payload or {},
-                proxies=proxies,
-                timeout=timeout,
-            )
+            kwargs = {
+                "method": method,
+                "url": url,
+                "headers": headers or {},
+                "params": params or {},
+                "timeout": timeout,
+                "impersonate": "chrome",
+            }
 
-            return response
+            if proxies:
+                kwargs["proxies"] = proxies
+
+            if payload is not None:
+                kwargs["json"] = payload
+
+            return session.request(**kwargs)
 
         except KeyboardInterrupt:
             raise
@@ -109,21 +159,14 @@ class Proxy:
         except requests.RequestsError:
             return None
 
-    def fetch_data(self, session, site_config):
-        if self.stop_event.is_set():
-            return None
-
-        url = site_config.get("URL")
-
-        if not url:
-            return None
-
+    def fetch_data(self, session, url, site_config):
         method = site_config.get("METHOD", "GET").upper()
         headers = deepcopy(site_config.get("HEADERS", {}))
         params = deepcopy(site_config.get("PARAMS", {}))
-        payload = deepcopy(site_config.get("PAYLOAD", {}))
+        payload = deepcopy(site_config.get("PAYLOAD"))
+        timeout = deepcopy(site_config.get("TIMEOUT", self.source_timeout))
 
-        if "User-Agent" not in headers:
+        if not any(key.lower() == "user-agent" for key in headers):
             headers["User-Agent"] = ua.chrome
 
         response = self.make_request(
@@ -133,1091 +176,1107 @@ class Proxy:
             headers=headers,
             params=params,
             payload=payload,
-            timeout=self.source_timeout,
+            timeout=timeout,
         )
 
-        if response is None:
+        if response is None or not response.ok:
             return None
 
-        if not response.ok:
-            return None
+        encoding = site_config.get("ENCODING")
+
+        if encoding:
+            try:
+                return response.content.decode(encoding, errors="replace")
+            except (LookupError, UnicodeDecodeError):
+                pass
 
         return response.text
 
-    def normalize_proxy(self, ip, port=None, proxy=None):
-        if proxy:
-            return proxy
+    def extract_path(self, data, path):
+        if path is None or path == "":
+            return data
 
-        if ip is None:
+        if isinstance(path, dict):
+            return self.extract_field(data, path)
+
+        if isinstance(path, (list, tuple)):
+            path = ",".join(map(str, path))
+
+        if not isinstance(path, str):
             return None
 
-        ip = str(ip).strip()
+        for key in path.split(","):
+            key = key.strip()
 
-        if not ip:
-            return None
-
-        if port is not None:
-            port = str(port).strip()
-
-            if port:
-                return f"{ip}:{port}"
-
-        return ip
-
-    def submit_proxy(self, proxy):
-        if not proxy:
-            return
-
-        if self.stop_event.is_set():
-            return
-
-        proxy = str(proxy).strip()
-
-        if not proxy:
-            return
-
-        with self.seen_lock:
-            if proxy in self.seen:
-                return
-
-            self.seen.add(proxy)
-
-        while not self.stop_event.is_set():
             try:
-                self.validation_queue.put(proxy, timeout=0.1)
+                if isinstance(data, dict):
+                    data = data[key]
+                elif isinstance(data, (list, tuple)):
+                    data = data[int(key)]
+                else:
+                    return None
 
-                return
+            except (KeyError, IndexError, ValueError, TypeError):
+                return None
 
+        return data
+
+    def _xpath_value(self, node, xpath, index=0, text=False):
+        if not xpath:
+            return None
+
+        try:
+            values = node.xpath(xpath)
+
+            if not isinstance(values, list):
+                values = [values]
+
+            if not 0 <= index < len(values):
+                return None
+
+            value = values[index]
+
+            if isinstance(value, bytes):
+                return value.decode(errors="replace").strip()
+
+            if isinstance(value, str):
+                return value.strip()
+
+            if hasattr(value, "text_content"):
+                return value.text_content().strip()
+
+            if text:
+                return str(value).strip()
+
+            return value
+
+        except (ValueError, TypeError, IndexError):
+            return None
+
+    def _decode_value(self, value, encoding):
+        if value is None:
+            return None
+
+        if not isinstance(value, str):
+            return value
+
+        encoding = str(encoding).upper()
+
+        if encoding == "BASE64":
+            try:
+                padded = value.strip()
+                padded += "=" * (-len(padded) % 4)
+                decoded = base64.b64decode(padded).decode("utf-8", errors="replace")
+                return decoded.strip()
             except Exception:
-                continue
+                return value
 
-    def validation_worker(self):
-        session = requests.Session(impersonate="chrome")
+        return value
 
-        try:
-            while not self.stop_event.is_set():
-                try:
-                    proxy = self.validation_queue.get(timeout=0.1)
+    def _safe_eval(self, expression, variables=None):
+        variables = variables or {}
 
-                except Empty:
-                    continue
+        if isinstance(expression, (int, float)):
+            return expression
 
-                try:
-                    if self.stop_event.is_set():
-                        continue
+        if not isinstance(expression, str):
+            raise InvalidDataTypeException("Invalid expression")
 
-                    result = self.check_working_proxy(session=session, proxy=proxy)
+        tree = ast.parse(expression.strip(), mode="eval")
 
-                    if result:
-                        with self.proxy_lock:
-                            if self.proxy is None:
-                                self.proxy = result
-                                self.result_event.set()
-                                self.stop_event.set()
+        def evaluate(node):
+            if isinstance(node, ast.Expression):
+                return evaluate(node.body)
 
-                finally:
-                    self.validation_queue.task_done()
+            if isinstance(node, ast.Constant):
+                if isinstance(node.value, (int, float)):
+                    return node.value
+                raise InvalidDataTypeException("Invalid expression value")
 
-        finally:
-            session.close()
+            if isinstance(node, ast.Name):
+                if node.id in variables and isinstance(
+                    variables[node.id], (int, float)
+                ):
+                    return variables[node.id]
 
-    def check_working_proxy(self, session, proxy):
-        if self.stop_event.is_set():
+                raise InvalidDataTypeException(
+                    f"Unknown expression variable: {node.id}"
+                )
+
+            if isinstance(node, ast.BinOp):
+                operation = self._OPERATORS.get(type(node.op))
+
+                if operation is None:
+                    raise InvalidDataTypeException("Unsupported operator")
+
+                left = evaluate(node.left)
+                right = evaluate(node.right)
+
+                if isinstance(node.op, ast.Pow) and abs(right) > 10:
+                    raise InvalidDataTypeException("Exponent too large")
+
+                return operation(left, right)
+
+            if isinstance(node, ast.UnaryOp):
+                operation = self._UNARY_OPERATORS.get(type(node.op))
+
+                if operation is None:
+                    raise InvalidDataTypeException("Unsupported unary operator")
+
+                return operation(evaluate(node.operand))
+
+            raise InvalidDataTypeException("Unsupported expression")
+
+        result = evaluate(tree)
+
+        if not isinstance(result, (int, float)):
+            raise InvalidDataTypeException("Invalid expression result")
+
+        return result
+
+    def _extract_regex(self, value, config):
+        if value is None:
             return None
 
-        proxies = {
-            "http": proxy,
-            "https": proxy,
-        }
+        if not isinstance(value, str):
+            value = str(value)
 
-        try:
-            response = session.post(
-                url="https://api3.pvrcinemas.com/api/v1/booking/content/city",
-                params={
-                    "lat": "0.000",
-                    "lng": "0.000",
-                },
-                headers={
-                    "accept": "application/json, text/plain, */*",
-                    "accept-language": "en-GB,en;q=0.6",
-                    "appversion": "1.0",
-                    "cache-control": "no-cache",
-                    "chain": "PVR",
-                    "city": "",
-                    "content-type": "application/json",
-                    "country": "INDIA",
-                    "dnt": "1",
-                    "flow": "PVRINOX",
-                    "origin": "https://www.pvrcinemas.com",
-                    "platform": "WEBSITE",
-                    "pragma": "no-cache",
-                    "priority": "u=1, i",
-                },
-                proxies=proxies,
-                timeout=self.proxy_timeout,
-            )
-
-            if response.ok:
-                return proxy
-
-        except KeyboardInterrupt:
-            raise
-
-        except requests.RequestsError:
-            return None
-
-        return None
-
-    def process_json(self, site_config):
-        data = site_config.get("DATA", "")
-
-        if not data:
-            return
-
-        if isinstance(data, (dict, list)):
-            site_config["FORMATTED_DATA"] = data
-            return
-
-        try:
-            site_config["FORMATTED_DATA"] = json.loads(data)
-
-        except Exception:
-            return
-
-    def process_html(self, site_config):
-        html_config = site_config.get("RULE_HTML", {})
-        html_data = site_config.get("DATA", "")
-
-        if html_data is None:
-            return
-
-        if hasattr(html_data, "xpath"):
-            site_config["FORMATTED_DATA"] = html_data
-            return
-
-        if isinstance(html_data, bytes):
-            html_data = html_data.decode("utf-8", errors="ignore")
-
-        if not isinstance(html_data, str):
-            html_data = str(html_data)
-
-        if "XPATH" not in html_config and "FIELDS" not in html_config:
-            return
-
-        try:
-            tree = html.fromstring(html_data)
-
-        except Exception:
-            return
-
-        site_config["FORMATTED_DATA"] = tree
-
-    def process_html_pandas(self, site_config):
-        html_data = site_config.get("DATA", "")
-        html_config = site_config.get("RULE_HTML", {})
-        index = html_config.get("INDEX", 0)
-
-        try:
-            if isinstance(html_data, str):
-                tables = pd.read_html(StringIO(html_data))
-            else:
-                tables = pd.read_html(StringIO(str(html_data)))
-
-        except Exception:
-            return
-
-        if index >= len(tables):
-            return
-
-        table = tables[index].copy()
-        header_row = html_config.get("HEADER_ROW")
-        data_start = html_config.get("DATA_START")
-
-        if header_row is not None:
-            if header_row >= len(table):
-                return
-
-            table.columns = table.iloc[header_row]
-
-        if data_start is not None:
-            table = table.iloc[data_start:].copy()
-
-        table = table.reset_index(drop=True)
-
-        if "FIELDS" in html_config:
-            site_config["FORMATTED_DATA"] = [
-                row.tolist() for _, row in table.iterrows()
-            ]
-
-            return
-
-        json_data = json.loads(table.to_json(orient="records"))
-        filters = site_config.get("FILTERS")
-
-        if filters:
-            json_data = [row for row in json_data if self.check_filters(row, filters)]
-
-        site_config["FORMATTED_DATA"] = json_data
-
-    def process_html_script(self, site_config):
-        html_config = site_config.get("RULE_HTML", {})
-        script_config = html_config.get("SCRIPT")
-        html_data = site_config.get("DATA", "")
-
-        if not script_config:
-            return {}
-
-        pattern = script_config.get("REGEX")
-        separator = script_config.get("SEP", ";")
-        assignment_separator = script_config.get("ASSIGNMENT", "=")
+        pattern = config.get("PATTERN")
 
         if not pattern:
-            return {}
+            return None
 
-        match = re.search(pattern, html_data, re.DOTALL)
+        match = re.search(pattern, value, re.DOTALL)
 
         if not match:
-            return {}
+            return None
 
-        script = match.group(1)
+        group = config.get("GROUP", 1)
+
+        try:
+            return match.group(group)
+        except (IndexError, KeyError):
+            return None
+
+    def _get_source_value(self, data, config):
+        if not isinstance(config, dict):
+            return self.extract_path(data, config)
+
+        source = config.get("SOURCE")
+
+        if source is None:
+            if "XPATH" in config:
+                return self._xpath_value(
+                    data,
+                    config.get("XPATH"),
+                    config.get("INDEX", 0),
+                    config.get("TEXT") == "YES",
+                )
+
+            return self.extract_path(data, config)
+
+        source_type = str(source.get("TYPE", "")).upper()
+
+        if source_type == "KEY":
+            value = self.extract_path(data, source.get("KEY"))
+
+        elif source_type == "COLUMN":
+            index = source.get("INDEX", 0)
+
+            try:
+                if hasattr(data, "iloc"):
+                    value = data.iloc[index]
+                elif isinstance(data, dict):
+                    value = list(data.values())[index]
+                else:
+                    value = data[index]
+            except (IndexError, KeyError, TypeError):
+                value = None
+
+        elif source_type == "XPATH":
+            value = self._xpath_value(
+                data, source.get("XPATH"), source.get("INDEX", 0), True
+            )
+
+        else:
+            value = None
+
+        if source.get("RAW") != "YES" and isinstance(value, str):
+            value = value.strip()
+
+        return value
+
+    def _transform_value(self, value, field_config, site_config=None):
+        if value is None:
+            return None
+
+        decode = field_config.get("DECODE")
+
+        if decode:
+            value = self._decode_value(value, decode)
+
+        extract = field_config.get("EXTRACT")
+
+        if extract:
+            extract_type = str(extract.get("TYPE", "")).upper()
+
+            if extract_type == "REGEX":
+                value = self._extract_regex(value, extract)
+
+        transform = field_config.get("TRANSFORM")
+
+        if transform and value is not None:
+            transform_type = str(transform.get("TYPE", "")).upper()
+
+            if transform_type == "EVAL_EXPRESSION":
+                separator = transform.get("SEP")
+
+                if isinstance(value, str):
+                    value = value.strip()
+
+                    if separator and separator in value:
+                        value = value.split(separator)[-1]
+
+                variables = (site_config or {}).get("SCRIPT_VARS", {})
+                value = self._safe_eval(value, variables)
+
+        return value
+
+    def extract_field(self, data, field_config, site_config=None):
+        if not isinstance(field_config, dict):
+            return self.extract_path(data, field_config)
+
+        value = self._get_source_value(data, field_config)
+
+        if value is None:
+            return None
+
+        return self._transform_value(value, field_config, site_config)
+
+    def _parse_script(self, data, script_config, site_config=None):
+        if not isinstance(data, str):
+            return None
+
+        pattern = script_config.get("REGEX")
+        value = data
+
+        if pattern:
+            match = re.search(pattern, data, re.DOTALL)
+
+            if match:
+                group = script_config.get("GROUP", 1)
+
+                try:
+                    value = match.group(group)
+                except (IndexError, KeyError):
+                    value = match.group(0)
+
+        script_type = str(script_config.get("TYPE", "")).upper()
+
+        if script_type == "JSON":
+            candidates = [value, value.strip().rstrip(";")]
+
+            for candidate in candidates:
+                try:
+                    return json.loads(candidate)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+
+            return None
 
         variables = {}
 
-        for item in script.split(separator):
-            item = item.strip()
+        assignment_pattern = re.compile(
+            r"(?:\b(?:var|let|const)\s+)?([A-Za-z_$][\w$]*)\s*=\s*([^;]+);"
+        )
 
-            if not item or assignment_separator not in item:
+        assignments = assignment_pattern.findall(data)
+        pending = list(assignments)
+
+        for _ in range(len(pending) + 1):
+            unresolved = []
+            changed = False
+
+            for name, expression in pending:
+                expression = expression.strip()
+                expression = re.sub(
+                    r"\bparseInt\s*\(\s*([^()]+)\s*\)", r"(\1)", expression
+                )
+
+                try:
+                    variables[name] = self._safe_eval(expression, variables)
+                    changed = True
+
+                except (
+                    SyntaxError,
+                    ValueError,
+                    TypeError,
+                    InvalidDataTypeException,
+                    ZeroDivisionError,
+                ):
+                    unresolved.append((name, expression))
+
+            pending = unresolved
+
+            if not pending or not changed:
+                break
+
+        if site_config is not None:
+            site_config["SCRIPT_VARS"] = variables
+
+        return value
+
+    def _decode_indexed_json(self, data):
+        if not isinstance(data, list) or len(data) < 3:
+            return data
+
+        records = []
+
+        for item in data:
+            if not isinstance(item, dict):
                 continue
 
-            key, value = item.split(assignment_separator, 1)
+            record = {}
 
-            key = key.strip()
-            value = value.strip()
+            for key, index in item.items():
+                if (
+                    isinstance(index, int)
+                    and not isinstance(index, bool)
+                    and 0 <= index < len(data)
+                ):
+                    record[key] = data[index]
 
-            if not key:
-                continue
+            if "ip" in record and "port" in record:
+                records.append(record)
 
-            try:
-                variables[key] = self.evaluate_expression(value, variables)
+        return records
 
-            except Exception:
-                continue
-
-        site_config["SCRIPT_VARS"] = variables
-
-        return variables
-
-    def process_csv(self, site_config):
-        csv_config = site_config.get("RULE_CSV", {})
+    def _parse_json(self, site_config):
         data = site_config.get("DATA", "")
 
-        if data is None:
+        try:
+            formatted = json.loads(data)
+        except (json.JSONDecodeError, TypeError):
+            formatted = {}
+
+        rule = site_config.get("RULE_JSON", {})
+
+        if rule.get("INDEXED") == "YES":
+            formatted = self._decode_indexed_json(formatted)
+
+        site_config["FORMATTED_DATA"] = formatted
+
+        nested_html = rule.get("RULE_HTML")
+
+        if nested_html:
+            html_data = self.extract_path(formatted, rule.get("PARENT"))
+
+            if isinstance(html_data, str):
+                nested_config = {
+                    "DATA": html_data,
+                    "RULE_HTML": nested_html,
+                    "SOURCE": site_config.get("SOURCE"),
+                }
+
+                self._parse_html(nested_config)
+
+                site_config["FORMATTED_DATA"] = nested_config.get("FORMATTED_DATA", [])
+
+    def _parse_html(self, site_config):
+        data = site_config.get("DATA", "")
+        rule = site_config.get("RULE_HTML", {})
+
+        if not isinstance(data, str) or not data.strip():
+            site_config["FORMATTED_DATA"] = []
+            return
+
+        script_config = rule.get("SCRIPT")
+
+        if script_config:
+            script_data = self._parse_script(data, script_config, site_config)
+
+            if str(script_config.get("TYPE", "")).upper() == "JSON":
+                site_config["FORMATTED_DATA"] = (
+                    script_data if isinstance(script_data, list) else []
+                )
+                return
+
+        if rule.get("PANDAS") == "YES":
+            self._parse_html_pandas(site_config)
+            return
+
+        xpath = rule.get("XPATH")
+
+        if not xpath:
+            site_config["FORMATTED_DATA"] = []
             return
 
         try:
-            if isinstance(data, pd.DataFrame):
-                table = data.copy()
-
-            else:
-                table = pd.read_csv(StringIO(str(data)), sep=csv_config.get("SEP", ","))
-
-        except Exception:
-            return
-
-        header_row = csv_config.get("HEADER_ROW")
-        data_start = csv_config.get("DATA_START")
-
-        if header_row is not None:
-            if header_row >= len(table):
-                return
-
-            table.columns = table.iloc[header_row]
-
-        if data_start is not None:
-            table = table.iloc[data_start:].copy()
-
-        table = table.reset_index(drop=True)
-
-        site_config["FORMATTED_DATA"] = json.loads(table.to_json(orient="records"))
-
-    def get_generic_source_value(self, record, source):
-        source_type = source.get("TYPE", "KEY").upper()
-
-        if source_type == "KEY":
-            if not isinstance(record, dict):
-                return None
-
-            return record.get(source.get("KEY"))
-
-        if source_type == "COLUMN":
-            index = source.get("INDEX")
-
-            if index is None:
-                return None
-
-            try:
-                return record[index]
-
-            except Exception:
-                return None
-
-        if source_type == "XPATH":
-            if not hasattr(record, "xpath"):
-                return None
-
-            value = record.xpath(source.get("XPATH", ""))
-
-            if "INDEX" in source:
-                index = source["INDEX"]
-
-                if not isinstance(value, (list, tuple)) or len(value) <= index:
-                    return None
-
-                value = value[index]
-
-            if isinstance(value, (list, tuple)):
-                if not value:
-                    return None
-
-                value = value[0]
-
-            if hasattr(value, "text_content"):
-                value = value.text_content()
-
-            elif hasattr(value, "text"):
-                value = value.text or ""
-
-            return value
-
-        if source_type == "VALUE":
-            return source.get("VALUE")
-
-        if source_type == "TEXT":
-            return record
-
-        return None
-
-    def apply_generic_extract(self, value, extract):
-        if value is None or not extract:
-            return value
-
-        extract_type = extract.get("TYPE", "REGEX").upper()
-
-        if extract_type == "REGEX":
-            pattern = extract.get("PATTERN")
-            group = extract.get("GROUP", 1)
-
-            if not pattern:
-                return value
-
-            match = re.search(pattern, str(value), re.DOTALL)
-
-            if not match:
-                return None
-
-            try:
-                return match.group(group)
-
-            except IndexError:
-                return None
-
-        return value
-
-    def apply_generic_transform(self, value, transform, variables=None):
-        if value is None or not transform:
-            return value
-
-        if isinstance(transform, str):
-            transform = {"TYPE": transform}
-
-        transform_type = transform.get("TYPE", "").upper()
-
-        if transform_type == "BASE64":
-            try:
-                return base64.b64decode(str(value)).decode()
-
-            except Exception:
-                return None
-
-        if transform_type == "STRIP":
-            return str(value).strip()
-
-        if transform_type == "EVAL_EXPRESSION":
-            separator = transform.get("SEP", "+")
-            parts = str(value).split(separator)
-            variables = variables or {}
-
+            tree = html.fromstring(data)
+            rows = tree.xpath(xpath)
             result = []
 
-            for part in parts:
-                part = part.strip()
+            for row in rows:
+                item = {}
 
-                if not part:
-                    continue
+                for key, field_config in rule.get("FIELD_KEYS", {}).items():
+                    item[key] = self.extract_field(row, field_config, site_config)
 
-                try:
-                    evaluated = self.evaluate_expression(part, variables)
+                result.append(item)
 
-                except Exception:
-                    return None
+            site_config["FORMATTED_DATA"] = result
 
-                result.append(str(evaluated))
+        except (ValueError, TypeError, KeyError) as e:
+            site_config["FORMATTED_DATA"] = []
+            print(f"HTML parsing failed: {e}")
 
-            return "".join(result)
+    def _parse_html_pandas(self, site_config):
+        data = site_config.get("DATA", "")
+        rule = site_config.get("RULE_HTML", {})
+        table_index = rule.get("INDEX", 0)
 
-        return value
+        try:
+            tables = pd.read_html(StringIO(data))
 
-    def extract_generic_fields(self, site_config, record):
-        rule = (
-            site_config.get("RULE_HTML")
-            or site_config.get("RULE_JSON")
-            or site_config.get("RULE_TXT")
-            or site_config.get("RULE_CSV")
-            or {}
-        )
-
-        fields = rule.get("FIELDS", {})
-
-        if not fields:
-            return
-
-        variables = site_config.get("SCRIPT_VARS", {})
-
-        output = {}
-
-        for field_name, field_config in fields.items():
-            source = field_config.get("SOURCE", {})
-
-            value = self.get_generic_source_value(record, source)
-            value = self.apply_generic_extract(value, field_config.get("EXTRACT"))
-            value = self.apply_generic_transform(
-                value, field_config.get("TRANSFORM"), variables
-            )
-
-            if isinstance(value, str):
-                value = value.strip()
-
-            output[field_name] = value
-
-        ip = output.get("ip")
-        port = output.get("port")
-        proxy = output.get("proxy")
-
-        proxy = self.normalize_proxy(ip, port, proxy)
-
-        if proxy:
-            self.submit_proxy(proxy)
-
-    def extract_generic(self, site_config):
-        formatted_data = site_config.get("FORMATTED_DATA")
-
-        if formatted_data is None:
-            return
-
-        filters = site_config.get("FILTERS")
-
-        if not isinstance(formatted_data, list):
-            formatted_data = [formatted_data]
-
-        for record in formatted_data:
-            if self.stop_event.is_set():
+            if not 0 <= table_index < len(tables):
+                site_config["FORMATTED_DATA"] = []
                 return
 
-            if filters and not self.check_filters(record, filters):
-                continue
+            table = tables[table_index]
+            table.columns = [str(column).strip() for column in table.columns]
 
-            self.extract_generic_fields(site_config, record)
+            records = table.to_dict(orient="records")
+            data_start = int(rule.get("DATA_START", 0) or 0)
+            records = records[max(data_start, 0) :]
 
-    def safe_eval_node(self, node, variables):
-        binary_operators = {
-            ast.Add: operator.add,
-            ast.Sub: operator.sub,
-            ast.Mult: operator.mul,
-            ast.Div: operator.truediv,
-            ast.FloorDiv: operator.floordiv,
-            ast.Mod: operator.mod,
-            ast.Pow: operator.pow,
-        }
+            site_config["FORMATTED_DATA"] = records
 
-        unary_operators = {
-            ast.UAdd: operator.pos,
-            ast.USub: operator.neg,
-        }
+        except (ValueError, TypeError, ImportError, IndexError):
+            site_config["FORMATTED_DATA"] = []
 
-        if isinstance(node, ast.Constant):
-            return node.value
+    def _parse_txt(self, site_config):
+        data = site_config.get("DATA", "")
+        rule = site_config.get("RULE_TXT", {})
 
-        if isinstance(node, ast.Name):
-            if node.id not in variables:
-                raise NameError(node.id)
-
-            return variables[node.id]
-
-        if isinstance(node, ast.BinOp):
-            operation = binary_operators.get(type(node.op))
-
-            if operation is None:
-                raise ValueError("Unsupported operator")
-
-            return operation(
-                self.safe_eval_node(node.left, variables),
-                self.safe_eval_node(node.right, variables),
-            )
-
-        if isinstance(node, ast.UnaryOp):
-            operation = unary_operators.get(type(node.op))
-
-            if operation is None:
-                raise ValueError("Unsupported unary operator")
-
-            return operation(self.safe_eval_node(node.operand, variables))
-
-        raise ValueError("Unsupported expression")
-
-    def evaluate_expression(self, expression, variables=None):
-        variables = variables or {}
-
-        expression = str(expression).strip()
-
-        if not expression:
-            raise ValueError("Empty expression")
-
-        if expression.isdigit():
-            return int(expression)
-
-        tree = ast.parse(expression, mode="eval")
-
-        return self.safe_eval_node(tree.body, variables)
-
-    def check_filters(self, data, filters):
-        if not filters:
-            return True
-
-        def get_value(rule):
-            if hasattr(data, "xpath"):
-                value = data.xpath(rule["XPATH"])
-
-                if "INDEX" in rule:
-                    index = rule["INDEX"]
-
-                    if len(value) <= index:
-                        return None
-
-                    value = value[index]
-
-                if hasattr(value, "text_content"):
-                    return value.text_content().strip()
-
-                if hasattr(value, "text"):
-                    return (value.text or "").strip()
-
-                return str(value).strip()
-
-            if "COLUMN" in rule:
-                try:
-                    return data[rule["COLUMN"]]
-
-                except Exception:
-                    return None
-
-            if isinstance(data, dict):
-                return data.get(rule.get("KEY"))
-
-            return None
-
-        if "AND" in filters:
-            for rule in filters["AND"]:
-                if get_value(rule) != rule["VALUE"]:
-                    return False
-
-        if "OR" in filters:
-            matched = False
-
-            for rule in filters["OR"]:
-                if get_value(rule) == rule["VALUE"]:
-                    matched = True
-                    break
-
-            if not matched:
-                return False
-
-        if "CONTAINS" in filters:
-            rules = filters["CONTAINS"]
-
-            if isinstance(rules, dict):
-                rules = [rules]
-
-            for rule in rules:
-                value = get_value(rule)
-
-                if value is None:
-                    return False
-
-                if isinstance(value, (list, tuple, set)):
-                    if rule["VALUE"] not in value:
-                        return False
-
-                elif str(rule["VALUE"]) not in str(value):
-                    return False
-
-        if "EQUALS" in filters:
-            rules = filters["EQUALS"]
-
-            if isinstance(rules, dict):
-                rules = [rules]
-
-            for rule in rules:
-                value = get_value(rule)
-
-                if value is None:
-                    return False
-
-                if str(value).strip().lower() != str(rule["VALUE"]).strip().lower():
-                    return False
-
-        return True
-
-    def extract_json(self, site_config):
-        json_conf = site_config.get("RULE_JSON") or site_config.get("RULE_HTML")
-
-        if not json_conf:
+        if not isinstance(data, str):
+            site_config["FORMATTED_DATA"] = []
             return
 
-        if "FIELDS" in json_conf:
-            self.extract_generic(site_config)
-            return
+        separator = rule.get("SEP", rule.get("SEPARATOR", "\n"))
 
-        formatted_data = site_config.get("FORMATTED_DATA", {})
-
-        if "PARENT" in json_conf:
-            for key in json_conf["PARENT"].split(","):
-                if not isinstance(formatted_data, dict):
-                    return
-
-                formatted_data = formatted_data.get(key, {})
-
-        field_keys = json_conf.get("FIELD_KEYS", {})
-        filters = site_config.get("FILTERS")
-
-        if not isinstance(formatted_data, list):
-            formatted_data = [formatted_data]
-
-        for data in formatted_data:
-            if self.stop_event.is_set():
-                return
-
-            if not isinstance(data, dict):
-                continue
-
-            if filters and not self.check_filters(data, filters):
-                continue
-
-            output = {}
-
-            for field, key in field_keys.items():
-                output[field] = data.get(key)
-
-            ip = output.get("ip")
-            port = output.get("port")
-            proxy = output.get("proxy")
-
-            if "DECODE" in json_conf:
-                if ip:
-                    ip = self.decode(ip, json_conf["DECODE"])
-
-                if port:
-                    port = self.decode(port, json_conf["DECODE"])
-
-            proxy = self.normalize_proxy(ip, port, proxy)
-
-            if proxy:
-                self.submit_proxy(proxy)
-
-    def extract_html(self, site_config):
-        tree = site_config.get("FORMATTED_DATA")
-
-        if tree is None:
-            return
-
-        rule_html = site_config.get("RULE_HTML", {})
-        field_keys = rule_html.get("FIELD_KEYS", {})
-        xpath = rule_html.get("XPATH")
-
-        if not xpath:
-            return
-
-        rows = tree.xpath(xpath)
-        filters = site_config.get("FILTERS")
-
-        for row in rows:
-            if self.stop_event.is_set():
-                return
-
-            if filters and not self.check_filters(row, filters):
-                continue
-
-            data = {}
-
-            for field_name, field_config in field_keys.items():
-                value = row.xpath(field_config["XPATH"])
-
-                if "INDEX" in field_config:
-                    index = field_config["INDEX"]
-
-                    if len(value) <= index:
-                        value = None
-                    else:
-                        value = value[index]
-
-                if value is not None and field_config.get("TEXT") == "YES":
-                    if hasattr(value, "text_content"):
-                        value = value.text_content().strip()
-
-                    elif hasattr(value, "text"):
-                        value = (value.text or "").strip()
-
-                    else:
-                        value = str(value).strip()
-
-                data[field_name] = value
-
-            ip = data.get("ip")
-            port = data.get("port")
-            proxy = data.get("proxy")
-
-            if "DECODE" in rule_html:
-                if ip:
-                    ip = self.decode(ip, rule_html["DECODE"])
-
-                if port:
-                    port = self.decode(port, rule_html["DECODE"])
-
-                if proxy:
-                    proxy = self.decode(proxy, rule_html["DECODE"])
-
-            proxy = self.normalize_proxy(ip, port, proxy)
-
-            if proxy:
-                self.submit_proxy(proxy)
-
-    def process_text(self, site_config):
-        txt_config = site_config.get("RULE_TXT", {})
-        txt_data = site_config.get("DATA", "")
-        separator = txt_config.get("SEP")
-
-        if separator is None:
-            return
+        if not separator:
+            separator = "\n"
 
         site_config["FORMATTED_DATA"] = [
-            item.strip() for item in txt_data.split(separator) if item.strip()
+            item.strip() for item in data.split(separator) if item.strip()
         ]
 
-    def extract_txt(self, site_config):
-        formatted_data = site_config.get("FORMATTED_DATA", [])
-
-        for proxy in formatted_data:
-            if self.stop_event.is_set():
-                return
-
-            if proxy:
-                self.submit_proxy(proxy)
-
-    def extract_csv(self, site_config):
-        csv_config = site_config.get("RULE_CSV", {})
-        formatted_data = site_config.get("FORMATTED_DATA")
-
-        if formatted_data is None:
-            return
-
-        if not isinstance(formatted_data, list):
-            formatted_data = [formatted_data]
-
-        fields = csv_config.get("FIELD_KEYS", {})
-        filters = site_config.get("FILTERS")
-
-        for row in formatted_data:
-            if self.stop_event.is_set():
-                return
-
-            if not isinstance(row, dict):
+    def process_rules(self, site_config):
+        for key in list(site_config):
+            if not key.startswith("RULE_"):
                 continue
 
-            if filters and not self.check_filters(row, filters):
-                continue
+            rule_type = key[5:]
 
-            ip = row.get(fields.get("ip", "ip"))
-            port = row.get(fields.get("port", "port"))
-            proxy = row.get(fields.get("proxy", "proxy"))
+            if rule_type == "JSON":
+                self._parse_json(site_config)
 
-            proxy = self.normalize_proxy(ip, port, proxy)
+            elif rule_type == "HTML":
+                self._parse_html(site_config)
 
-            if proxy:
-                self.submit_proxy(proxy)
+            elif rule_type == "TXT":
+                self._parse_txt(site_config)
 
-    @staticmethod
-    def decode(text, decode_algo):
-        if text is None:
+        return site_config
+
+    def _normalize_proxy_url(self, value):
+        if not isinstance(value, str):
             return None
 
-        if decode_algo == "BASE64":
-            try:
-                return base64.b64decode(text).decode()
+        value = value.strip()
 
-            except Exception:
+        if not value or "://" not in value:
+            return None
+
+        try:
+            parsed = urlsplit(value)
+
+            if not parsed.hostname:
                 return None
 
-        return text
+            protocol = parsed.scheme.lower()
 
-    def process_rule(self, site_config):
+            if protocol not in (
+                "http",
+                "https",
+                "socks4",
+                "socks5",
+                "socks4a",
+                "socks5h",
+            ):
+                return None
+
+            return {
+                "ip": parsed.hostname,
+                "port": parsed.port,
+                "protocol": protocol,
+            }
+
+        except ValueError:
+            return None
+
+    def _normalize_proxy_address(self, value):
+        if not isinstance(value, str):
+            return None
+
+        value = value.strip()
+
+        if not value:
+            return None
+
+        full_url = self._normalize_proxy_url(value)
+
+        if full_url:
+            return full_url
+
+        match = re.match(
+            r"^(?P<ip>\[[^\]]+\]|[^:\s]+):(?P<port>\d+)$",
+            value,
+        )
+
+        if not match:
+            return None
+
+        ip = match.group("ip").strip("[]")
+        port = int(match.group("port"))
+
+        if not 1 <= port <= 65535:
+            return None
+
+        return {"ip": ip, "port": port}
+
+    def create_ip_object(self, ip_data, extraction_keys, site_config=None):
+        if not isinstance(ip_data, dict):
+            raise InvalidDataTypeException("Invalid proxy data")
+
+        field_keys = extraction_keys.get("FIELD_KEYS", extraction_keys)
+        proxy_data = {}
+
+        for field, field_config in field_keys.items():
+            if field not in Proxy.__dataclass_fields__:
+                continue
+
+            value = self.extract_field(ip_data, field_config, site_config)
+
+            if value is not None and value != "":
+                proxy_data[field] = value
+
+        if not proxy_data.get("ip"):
+            raise InvalidDataTypeException(f"Proxy IP is missing. Input: {ip_data}")
+
+        proxy_value = str(proxy_data["ip"]).strip()
+        normalized = self._normalize_proxy_address(proxy_value)
+
+        if normalized:
+            proxy_data["ip"] = normalized["ip"]
+
+            if normalized.get("port") is not None:
+                proxy_data["port"] = normalized["port"]
+
+            if normalized.get("protocol"):
+                proxy_data["protocol"] = normalized["protocol"]
+
+        else:
+            proxy_data["ip"] = proxy_value.strip("[]")
+
+        if proxy_data.get("port") is not None:
+            proxy_data["port"] = int(proxy_data["port"])
+
+            if not 1 <= proxy_data["port"] <= 65535:
+                raise InvalidDataTypeException("Invalid proxy port")
+
+        if proxy_data.get("asn") is not None:
+            proxy_data["asn"] = int(
+                re.sub(
+                    r"^AS",
+                    "",
+                    str(proxy_data["asn"]).strip(),
+                    flags=re.IGNORECASE,
+                )
+            )
+
+        if proxy_data.get("latency") is not None:
+            proxy_data["latency"] = float(proxy_data["latency"])
+
+        if proxy_data.get("protocol"):
+            protocol = str(proxy_data["protocol"]).strip().lower()
+
+            if protocol not in {
+                "http",
+                "https",
+                "socks4",
+                "socks5",
+                "socks4a",
+                "socks5h",
+            }:
+                proxy_data.pop("protocol", None)
+            else:
+                proxy_data["protocol"] = protocol
+
+        return Proxy(**proxy_data)
+
+    def _collect_proxy(self, proxy):
         if self.stop_event.is_set():
+            return False
+
+        if not self._matches_filters(proxy):
+            return False
+
+        with self.set_lock:
+            if self.stop_event.is_set():
+                return False
+
+            if proxy.proxy in self.output:
+                return False
+
+            if self.output_count >= self.count:
+                self.stop_event.set()
+                return False
+
+            self.output[proxy.proxy] = proxy
+            self.output_count += 1
+
+            if self.output_count >= self.count:
+                self.stop_event.set()
+
+            return True
+
+    def _extract_proxies(self, data, extraction_keys, site_config=None):
+        if data is None:
             return
 
-        rule_key = next(
+        parent = extraction_keys.get("PARENT")
+
+        if parent:
+            data = self.extract_path(data, parent)
+
+        if isinstance(data, dict):
+            data = [data]
+
+        if not isinstance(data, (list, tuple)):
+            return
+
+        for item in data:
+            if self.stop_event.is_set():
+                break
+
+            if not isinstance(item, dict):
+                continue
+
+            try:
+                proxy = self.create_ip_object(
+                    item,
+                    extraction_keys,
+                    site_config,
+                )
+
+                self._collect_proxy(proxy)
+
+            except (TypeError, ValueError, InvalidDataTypeException):
+                continue
+
+    def _extract_txt_proxies(self, data, extraction_keys):
+        if not isinstance(data, list):
+            return
+
+        pattern = extraction_keys.get(
+            "REGEX",
+            extraction_keys.get(
+                "PATTERN",
+                r"(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\s*:\s*(?P<port>\d+)",
+            ),
+        )
+
+        source_url = str(extraction_keys.get("SOURCE_URL", "")).lower()
+        protocol = extraction_keys.get("PROTOCOL")
+
+        if not protocol:
+            if "socks5" in source_url:
+                protocol = "socks5"
+            elif "socks4" in source_url:
+                protocol = "socks4"
+            elif "http" in source_url:
+                protocol = "http"
+            else:
+                protocol = "http"
+
+        field_keys = {
+            "ip": "ip",
+            "port": "port",
+            "protocol": "protocol",
+        }
+
+        field_keys.update(extraction_keys.get("FIELD_KEYS", {}))
+        object_config = {"FIELD_KEYS": field_keys}
+
+        for item in data:
+            if self.stop_event.is_set():
+                break
+
+            if not isinstance(item, str):
+                continue
+
+            item = item.strip()
+
+            if not item:
+                continue
+
+            match = re.search(pattern, item)
+
+            if match:
+                proxy_data = {
+                    key: value
+                    for key, value in match.groupdict().items()
+                    if value is not None
+                }
+
+                if not proxy_data.get("ip") or not proxy_data.get("port"):
+                    if match.lastindex and match.lastindex >= 2:
+                        proxy_data = {
+                            "ip": match.group(1),
+                            "port": match.group(2),
+                        }
+                    else:
+                        proxy_data = self._normalize_proxy_address(
+                            match.group(0).strip()
+                        )
+
+            else:
+                proxy_data = self._normalize_proxy_address(item)
+
+            if not isinstance(proxy_data, dict):
+                continue
+
+            proxy_data.setdefault("protocol", protocol)
+
+            try:
+                proxy = self.create_ip_object(
+                    proxy_data,
+                    object_config,
+                )
+
+                self._collect_proxy(proxy)
+
+            except (TypeError, ValueError, InvalidDataTypeException):
+                continue
+
+    def extract_keys(self, site_config):
+        source = site_config.get("SOURCE")
+        formatted_data = site_config.get("FORMATTED_DATA")
+
+        if source not in self._proxy_config:
+            return
+
+        if not isinstance(formatted_data, (list, tuple, dict)):
+            return
+
+        rule_type = next(
             (key for key in site_config if key.startswith("RULE_")),
             None,
         )
 
-        if not rule_key:
+        if not rule_type:
             return
 
-        rule_config = site_config.get(rule_key)
+        extraction_keys = site_config.get(rule_type, {})
 
-        if not isinstance(rule_config, dict):
-            return
+        if rule_type == "RULE_TXT":
+            self._extract_txt_proxies(
+                formatted_data,
+                extraction_keys,
+            )
 
-        if rule_key == "RULE_JSON":
-            self.process_json(site_config)
+        elif (
+            rule_type == "RULE_HTML"
+            and extraction_keys.get("XPATH")
+            and extraction_keys.get("PANDAS") != "YES"
+            and not extraction_keys.get("SCRIPT")
+        ):
+            normalized_keys = {
+                "FIELD_KEYS": {
+                    key: key for key in extraction_keys.get("FIELD_KEYS", {})
+                }
+            }
 
-        elif rule_key == "RULE_HTML":
-            if rule_config.get("SCRIPT"):
-                self.process_html_script(site_config)
+            self._extract_proxies(
+                formatted_data,
+                normalized_keys,
+                site_config,
+            )
 
-            if rule_config.get("PANDAS") == "YES":
-                self.process_html_pandas(site_config)
+        elif rule_type == "RULE_JSON" and extraction_keys.get("RULE_HTML"):
+            nested_keys = extraction_keys["RULE_HTML"].get(
+                "FIELD_KEYS",
+                {},
+            )
 
-            else:
-                self.process_html(site_config)
+            normalized_keys = {"FIELD_KEYS": {key: key for key in nested_keys}}
 
-        elif rule_key == "RULE_TXT":
-            self.process_text(site_config)
-
-        elif rule_key == "RULE_CSV":
-            self.process_csv(site_config)
+            self._extract_proxies(
+                formatted_data,
+                normalized_keys,
+                site_config,
+            )
 
         else:
-            return
+            self._extract_proxies(
+                formatted_data,
+                extraction_keys,
+                site_config,
+            )
 
-        nested_rule_key = next(
-            (key for key in rule_config if key.startswith("RULE_")),
-            None,
-        )
+    def _matches_filters(self, proxy):
+        for field in (
+            "country",
+            "country_code",
+            "state",
+            "state_code",
+            "city",
+            "region",
+            "continent",
+            "timezone",
+            "isp",
+            "organization",
+            "anonymity",
+        ):
+            expected = self.filters.get(field)
 
-        if nested_rule_key:
-            nested_config = deepcopy(site_config)
+            if expected is None:
+                continue
 
-            nested_config["DATA"] = site_config.get("FORMATTED_DATA")
-            nested_config["FORMATTED_DATA"] = None
+            actual = getattr(proxy, field)
 
-            nested_config.pop(rule_key, None)
+            if actual is None:
+                return False
 
-            nested_config[nested_rule_key] = rule_config[nested_rule_key]
+            if isinstance(expected, str):
+                if expected.lower() not in str(actual).lower():
+                    return False
 
-            self.process_rule(nested_config)
+            elif isinstance(expected, (list, tuple, set)):
+                if not any(
+                    str(value).lower() == str(actual).lower() for value in expected
+                ):
+                    return False
 
-            return
+        asn = self.filters.get("asn")
 
-        if rule_key == "RULE_JSON":
-            self.extract_json(site_config)
+        if asn is not None and proxy.asn != asn:
+            return False
 
-        elif rule_key == "RULE_HTML":
-            if rule_config.get("FIELDS"):
-                self.extract_generic(site_config)
+        min_latency = self.filters.get("min_latency")
 
-            elif rule_config.get("PANDAS") == "YES":
-                self.extract_json(site_config)
+        if min_latency is not None:
+            if proxy.latency is None or proxy.latency < min_latency:
+                return False
 
-            else:
-                self.extract_html(site_config)
+        max_latency = self.filters.get("max_latency")
 
-        elif rule_key == "RULE_TXT":
-            if rule_config.get("FIELDS"):
-                self.extract_generic(site_config)
+        if max_latency is not None:
+            if proxy.latency is None or proxy.latency > max_latency:
+                return False
 
-            else:
-                self.extract_txt(site_config)
-
-        elif rule_key == "RULE_CSV":
-            if rule_config.get("FIELDS"):
-                self.extract_generic(site_config)
-
-            else:
-                self.extract_csv(site_config)
+        return True
 
     def format_data(self, site_config):
-        self.process_rule(site_config)
+        self.process_rules(site_config)
+        self.extract_keys(site_config)
 
-    def format_config(self, site_config):
-        config = deepcopy(site_config)
-
-        rule_keys = [key for key in config if key.startswith("RULE_")]
-
-        for rule_key in rule_keys:
-            child_config = config[rule_key]
-
-            for key, value in config.items():
-                if not key.startswith("RULE_"):
-                    child_config.setdefault(key, value)
-
-        return config
-
-    def process_site(self, site):
+    def process_site(self, site, url, site_config):
         if self.stop_event.is_set():
-            return
-
-        site_config = self._proxy_config.get(site, {})
-
-        if not site_config:
             return
 
         session = requests.Session(impersonate="chrome")
 
         try:
-            site_config = self.format_config(site_config)
-            data = self.fetch_data(session=session, site_config=site_config)
+            site_config["SOURCE"] = site
 
-            if not data:
+            if isinstance(site_config.get("RULE_TXT"), dict):
+                site_config["RULE_TXT"]["SOURCE_URL"] = url
+
+            data = self.fetch_data(
+                session,
+                url,
+                site_config,
+            )
+
+            if not data or self.stop_event.is_set():
                 return
 
             site_config["DATA"] = data
-
             self.format_data(site_config)
-
-        except KeyboardInterrupt:
-            raise
-
-        except Exception as exc:
-            print(f"[{site}] failed: {exc}", flush=True)
 
         finally:
             session.close()
 
-    def source_worker(self, site):
+    def _start_source(self, job):
+        import traceback
+
+        site, url, site_config = job
+
         try:
-            self.process_site(site)
+            self.process_site(site, url, site_config)
 
         except KeyboardInterrupt:
-            return
+            raise
 
-        finally:
-            with self.sources_lock:
-                self.sources_remaining -= 1
+        except Exception as e:
+            print(
+                f"Worker error | source={site} | "
+                f"url={url} | error={type(e).__name__}: {e}"
+            )
 
-    def start_validation_workers(self):
-        self.validation_threads = []
+            traceback.print_exc()
 
-        for _ in range(self.proxy_workers):
-            thread = Thread(target=self.validation_worker, daemon=True)
+    def format_config(self, site_config):
+        site_config = deepcopy(site_config)
 
-            thread.start()
+        for key, value in site_config.items():
+            if key.startswith("RULE_") and isinstance(value, dict):
+                parent_config = {k: v for k, v in value.items() if k != "FIELD_KEYS"}
 
-            self.validation_threads.append(thread)
+                for config_key, config_value in site_config.items():
+                    if config_key != key:
+                        parent_config.setdefault(
+                            config_key,
+                            config_value,
+                        )
 
-    def start_source_workers(self, sites):
-        self.source_threads = []
+                for field_config in value.get("FIELD_KEYS", {}).values():
+                    if isinstance(field_config, dict):
+                        field_config.update(
+                            {
+                                k: v
+                                for k, v in parent_config.items()
+                                if k not in field_config
+                            }
+                        )
 
-        with self.sources_lock:
-            self.sources_remaining = len(sites)
+        return site_config
+
+    def _start_source_worker(self, sites):
+        jobs = []
 
         for site in sites:
-            if self.stop_event.is_set():
-                break
+            site_config = self._proxy_config.get(site, {})
+            urls = site_config.get("URL", [])
 
-            thread = Thread(target=self.source_worker, args=(site,), daemon=True)
+            if isinstance(urls, str):
+                urls = [urls]
 
-            thread.start()
+            for url in urls:
+                jobs.append(
+                    (
+                        site,
+                        url,
+                        self.format_config(site_config),
+                    )
+                )
 
-            self.source_threads.append(thread)
+        if not jobs:
+            return
 
-    def wait_for_result(self):
-        while True:
-            if self.result_event.wait(timeout=0.01):
-                with self.proxy_lock:
-                    return self.proxy
+        executor = ThreadPoolExecutor(max_workers=self._source_workers)
 
-            if self.stop_event.is_set():
-                with self.proxy_lock:
-                    return self.proxy
-
-            with self.sources_lock:
-                sources_remaining = self.sources_remaining
-
-            if sources_remaining == 0 and self.validation_queue.empty():
-                return None
-
-    def fetch(self, site_list=None):
-        if site_list:
-            sites = [site.strip() for site in site_list.split(",") if site.strip()]
-
-        else:
-            sites = list(self._proxy_config.keys())
-
-        self.stop_event.clear()
-        self.result_event.clear()
-
-        with self.proxy_lock:
-            self.proxy = None
-
-        with self.seen_lock:
-            self.seen.clear()
-
-        self.source_threads = []
-        self.validation_threads = []
-
-        self.start_validation_workers()
-        self.start_source_workers(sites)
+        futures = [executor.submit(self._start_source, job) for job in jobs]
 
         try:
-            result = self.wait_for_result()
+            for future in as_completed(futures):
+                try:
+                    future.result()
 
-            if result:
-                return result
+                except Exception as e:
+                    print(f"Worker error: {type(e).__name__}: {e}")
 
-            raise NoProxyFoundException("No working proxy found")
+                if self.stop_event.is_set():
+                    for pending in futures:
+                        pending.cancel()
+
+                    break
 
         except KeyboardInterrupt:
             self.stop_event.set()
-            raise SystemExit(130)
 
-        finally:
-            self.stop_event.set()
+            for pending in futures:
+                pending.cancel()
 
-            self.source_threads.clear()
-            self.validation_threads.clear()
+            executor.shutdown(
+                wait=False,
+                cancel_futures=True,
+            )
 
-    def check_required(self):
-        with self.proxy_lock:
-            return not self.proxy
+            raise
 
+        else:
+            executor.shutdown(
+                wait=True,
+                cancel_futures=True,
+            )
 
-def get_new_ua():
-    return ua.chrome
+    def fetch(
+        self,
+        count: int = 1,
+        sites: str | list | None = None,
+        country: str | None = None,
+        country_code: str | None = None,
+        state: str | None = None,
+        state_code: str | None = None,
+        city: str | None = None,
+        region: str | None = None,
+        continent: str | None = None,
+        timezone: str | None = None,
+        isp: str | None = None,
+        organization: str | None = None,
+        asn: int | None = None,
+        anonymity: str | None = None,
+        min_latency: float | None = None,
+        max_latency: float | None = None,
+    ):
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise InvalidDataTypeException("Count must be an integer")
 
+        if count < 1:
+            raise InvalidDataTypeException("Count must be greater than 0")
 
-if __name__ == "__main__":
-    proxy = Proxy(
-        source_workers=20,
-        proxy_workers=100,
-        source_timeout=3,
-        proxy_timeout=2,
-    )
+        if min_latency is not None and max_latency is not None:
+            if min_latency > max_latency:
+                raise InvalidDataTypeException("min_latency cannot exceed max_latency")
 
-    try:
-        result = proxy.fetch()
+        self.count = count
+        self.output = {}
+        self.output_count = 0
+        self.stop_event.clear()
 
-        if result:
-            print(result, flush=True)
+        self.filters = {
+            "country": country,
+            "country_code": country_code,
+            "state": state,
+            "state_code": state_code,
+            "city": city,
+            "region": region,
+            "continent": continent,
+            "timezone": timezone,
+            "isp": isp,
+            "organization": organization,
+            "asn": asn,
+            "anonymity": anonymity,
+            "min_latency": min_latency,
+            "max_latency": max_latency,
+        }
 
-    except NoProxyFoundException:
-        print("No working proxy found.", flush=True)
+        sites = self._normalize_sites(sites)
+        self._validate_sites(sites)
 
-        sys.exit(1)
+        self._start_source_worker(sites)
+
+        return list(self.output.values())
