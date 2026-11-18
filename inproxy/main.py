@@ -46,6 +46,7 @@ class Proxy:
     source: str | None = None
     continent_code: str | None = None
     pincode: str | None = None
+    google: bool | None = None
 
     @property
     def proxy(self):
@@ -210,9 +211,19 @@ class InProxy:
 
             try:
                 if isinstance(data, dict):
-                    data = data[key]
+                    if key in data:
+                        data = data[key]
+                    elif key.isdigit() and int(key) in data:
+                        data = data[int(key)]
+                    else:
+                        return None
+
                 elif isinstance(data, (list, tuple)):
+                    if not key.isdigit():
+                        return None
+
                     data = data[int(key)]
+
                 else:
                     return None
 
@@ -430,15 +441,25 @@ class InProxy:
 
             if transform_type == "EVAL_EXPRESSION":
                 separator = transform.get("SEP")
+                variables = (site_config or {}).get("SCRIPT_VARS", {})
 
                 if isinstance(value, str):
                     value = value.strip()
 
                     if separator and separator in value:
-                        value = value.split(separator)[-1]
+                        value = value.split(separator)[-1].strip()
 
-                variables = (site_config or {}).get("SCRIPT_VARS", {})
-                value = self._safe_eval(value, variables)
+                    expressions = re.findall(r"\(([^()]*)\)", value)
+
+                    if expressions:
+                        value = "".join(
+                            str(self._safe_eval(expression, variables))
+                            for expression in expressions
+                        )
+                    else:
+                        value = self._safe_eval(value, variables)
+                else:
+                    value = self._safe_eval(value, variables)
 
         return value
 
@@ -601,6 +622,39 @@ class InProxy:
                 )
                 return
 
+        if rule.get("REGEX"):
+            try:
+                rows = re.findall(rule["REGEX"], data, re.DOTALL)
+                result = []
+
+                for row in rows:
+                    if isinstance(row, tuple):
+                        row = "".join(str(value) for value in row)
+
+                    item = {}
+
+                    for key, field_config in rule.get("FIELD_KEYS", {}).items():
+                        if isinstance(field_config, dict):
+                            item[key] = self._transform_value(
+                                row,
+                                field_config,
+                                site_config,
+                            )
+                        else:
+                            item[key] = self._extract_regex(
+                                row,
+                                {"PATTERN": field_config},
+                            )
+
+                    result.append(item)
+
+                site_config["FORMATTED_DATA"] = result
+
+            except (re.error, TypeError, AttributeError):
+                site_config["FORMATTED_DATA"] = []
+
+            return
+
         if rule.get("PANDAS") == "YES":
             self._parse_html_pandas(site_config)
             return
@@ -620,7 +674,11 @@ class InProxy:
                 item = {}
 
                 for key, field_config in rule.get("FIELD_KEYS", {}).items():
-                    item[key] = self.extract_field(row, field_config, site_config)
+                    item[key] = self.extract_field(
+                        row,
+                        field_config,
+                        site_config,
+                    )
 
                 result.append(item)
 
@@ -874,14 +932,8 @@ class InProxy:
                 continue
 
             try:
-                proxy = self.create_ip_object(
-                    item,
-                    extraction_keys,
-                    site_config,
-                )
-
+                proxy = self.create_ip_object(item, extraction_keys, site_config)
                 self._collect_proxy(proxy)
-
             except (TypeError, ValueError, InvalidDataTypeException):
                 continue
 
@@ -996,6 +1048,19 @@ class InProxy:
                 extraction_keys,
             )
 
+        elif rule_type == "RULE_HTML" and extraction_keys.get("REGEX"):
+            normalized_keys = {
+                "FIELD_KEYS": {
+                    key: key for key in extraction_keys.get("FIELD_KEYS", {})
+                }
+            }
+
+            self._extract_proxies(
+                formatted_data,
+                normalized_keys,
+                site_config,
+            )
+
         elif (
             rule_type == "RULE_HTML"
             and extraction_keys.get("XPATH")
@@ -1104,11 +1169,7 @@ class InProxy:
             if isinstance(site_config.get("RULE_TXT"), dict):
                 site_config["RULE_TXT"]["SOURCE_URL"] = url
 
-            data = self.fetch_data(
-                session,
-                url,
-                site_config,
-            )
+            data = self.fetch_data(session, url, site_config)
 
             if not data or self.stop_event.is_set():
                 return
@@ -1175,13 +1236,7 @@ class InProxy:
                 urls = [urls]
 
             for url in urls:
-                jobs.append(
-                    (
-                        site,
-                        url,
-                        self.format_config(site_config),
-                    )
-                )
+                jobs.append((site, url, self.format_config(site_config)))
 
         if not jobs:
             return
@@ -1241,6 +1296,7 @@ class InProxy:
         anonymity: str | None = None,
         min_latency: float | None = None,
         max_latency: float | None = None,
+        google: bool | None = None,
     ):
         if not isinstance(count, int) or isinstance(count, bool):
             raise InvalidDataTypeException("Count must be an integer")
@@ -1272,6 +1328,7 @@ class InProxy:
             "anonymity": anonymity,
             "min_latency": min_latency,
             "max_latency": max_latency,
+            "google": google,
         }
 
         sites = self._normalize_sites(sites)

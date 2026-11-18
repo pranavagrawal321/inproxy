@@ -1,7 +1,8 @@
+#!/usr/bin/env python3
+import io
 import os
 import re
-
-from setuptools import find_packages, setup
+from setuptools import setup, find_packages
 
 
 def get_version():
@@ -21,13 +22,13 @@ def parse_requirements(filename):
 
 
 here = os.path.abspath(os.path.dirname(__file__))
-with open(os.path.join(here, "README.md"), encoding="utf-8") as f:
+with io.open(os.path.join(here, "README.md"), encoding="utf-8") as f:
     long_description = "\n" + f.read()
 
 setup(
     name="inproxy",
     version=get_version(),
-    description="An easy way to fetch HTTPS Indian proxies",
+    description="",
     long_description=long_description,
     python_requires=">=3.10",
     long_description_content_type="text/markdown",
@@ -39,10 +40,10 @@ setup(
     license="MIT",
     zip_safe=True,
     keywords=[
-        "proxy",
-        "proxies",
-        "indian proxies",
-        "https proxies",
+        "user agent",
+        "app detection",
+        "device detection",
+        "client hints",
     ],
     include_package_data=True,
     license_files=["LICENSE"],
@@ -50,16 +51,10 @@ setup(
         "": ["*.yml", "*.sh"],
     },
     install_requires=parse_requirements("requirements.txt"),
-    entry_points={
-        "console_scripts": [
-            "inproxy=inproxy.__main__:main",
-        ],
-    },
     classifiers=[
         "Environment :: Web Environment",
         "Intended Audience :: Developers",
         "Operating System :: OS Independent",
-        "License :: OSI Approved :: MIT License",
         "Programming Language :: Python",
         "Topic :: Internet :: WWW/HTTP",
         "Topic :: Software Development :: Libraries :: Python Modules",
