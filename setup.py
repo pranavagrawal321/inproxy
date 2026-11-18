@@ -6,14 +6,15 @@ from setuptools import setup, find_packages
 
 
 def get_version():
-    with open("inproxy/__init__.py", "r") as f:
-        line = f.readline()
-        match = re.match(r"__version__ = \'([\d\.]+)\'", line)
+    with open("inproxy/__init__.py", "r", encoding="utf-8") as f:
+        content = f.read()
 
-        if not match:
-            raise ImportError("Can't read the version of inproxy")
+    match = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', content, re.MULTILINE)
 
-        return match.group(1)
+    if not match:
+        raise RuntimeError("Unable to determine package version")
+
+    return match.group(1)
 
 
 def parse_requirements(filename):
