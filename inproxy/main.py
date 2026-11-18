@@ -818,70 +818,137 @@ class InProxy:
             raise InvalidDataTypeException("Invalid proxy data")
 
         field_keys = extraction_keys.get("FIELD_KEYS", extraction_keys)
-        proxy_data = {}
+        field_keys = {
+            field: config
+            for field, config in field_keys.items()
+            if field in Proxy.__dataclass_fields__
+        }
 
-        for field, field_config in field_keys.items():
-            if field not in Proxy.__dataclass_fields__:
+        list_path = None
+
+        for field_config in field_keys.values():
+            if not isinstance(field_config, str):
                 continue
 
-            value = self.extract_field(ip_data, field_config, site_config)
+            keys = [key.strip() for key in field_config.split(",") if key.strip()]
+            current = ip_data
 
-            if value is not None and value != "":
-                proxy_data[field] = value
+            for index, key in enumerate(keys[:-1]):
+                if isinstance(current, dict):
+                    current = current.get(key)
+                elif isinstance(current, (list, tuple)):
+                    break
+                else:
+                    break
 
-        if not proxy_data.get("ip"):
+                if isinstance(current, (list, tuple)):
+                    list_path = ",".join(keys[:index + 1])
+                    break
+
+            if list_path:
+                break
+
+        records = self.extract_path(ip_data, list_path) if list_path else [ip_data]
+
+        if isinstance(records, dict):
+            records = [records]
+
+        if not isinstance(records, (list, tuple)):
+            records = [ip_data]
+
+        proxies = []
+
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+
+            proxy_data = {}
+
+            for field, field_config in field_keys.items():
+                if isinstance(field_config, str) and list_path:
+                    prefix = list_path + ","
+
+                    if field_config.startswith(prefix):
+                        field_config = field_config[len(prefix):]
+                        source_data = record
+                    else:
+                        source_data = ip_data
+                else:
+                    source_data = record if not list_path else ip_data
+
+                value = self.extract_field(source_data, field_config, site_config)
+
+                if value is not None and value != "":
+                    proxy_data[field] = value
+
+            if not proxy_data.get("ip"):
+                continue
+
+            proxy_value = str(proxy_data["ip"]).strip()
+            normalized = self._normalize_proxy_address(proxy_value)
+
+            if normalized:
+                proxy_data["ip"] = normalized["ip"]
+
+                if normalized.get("port") is not None:
+                    proxy_data["port"] = normalized["port"]
+
+                if normalized.get("protocol"):
+                    proxy_data["protocol"] = normalized["protocol"]
+            else:
+                proxy_data["ip"] = proxy_value.strip("[]")
+
+            if proxy_data.get("port") is not None:
+                proxy_data["port"] = int(proxy_data["port"])
+
+                if not 1 <= proxy_data["port"] <= 65535:
+                    continue
+
+            if proxy_data.get("asn") is not None:
+                proxy_data["asn"] = int(
+                    re.sub(
+                        r"^AS",
+                        "",
+                        str(proxy_data["asn"]).strip(),
+                        flags=re.IGNORECASE,
+                    )
+                )
+
+            if proxy_data.get("latency") is not None:
+                proxy_data["latency"] = float(proxy_data["latency"])
+
+            if "protocol" in proxy_data:
+                protocol = proxy_data["protocol"]
+
+                if isinstance(protocol, (list, tuple)):
+                    protocol = protocol[0] if protocol else None
+
+                protocol = str(protocol).strip().lower() if protocol is not None else None
+
+                if protocol not in {
+                    "http",
+                    "https",
+                    "socks4",
+                    "socks5",
+                    "socks4a",
+                    "socks5h",
+                }:
+                    proxy_data.pop("protocol", None)
+                else:
+                    proxy_data["protocol"] = protocol
+
+            try:
+                proxies.append(Proxy(**proxy_data))
+            except (TypeError, ValueError):
+                continue
+
+        if not proxies:
             raise InvalidDataTypeException(f"Proxy IP is missing. Input: {ip_data}")
 
-        proxy_value = str(proxy_data["ip"]).strip()
-        normalized = self._normalize_proxy_address(proxy_value)
+        for proxy in proxies[1:]:
+            self._collect_proxy(proxy)
 
-        if normalized:
-            proxy_data["ip"] = normalized["ip"]
-
-            if normalized.get("port") is not None:
-                proxy_data["port"] = normalized["port"]
-
-            if normalized.get("protocol"):
-                proxy_data["protocol"] = normalized["protocol"]
-
-        else:
-            proxy_data["ip"] = proxy_value.strip("[]")
-
-        if proxy_data.get("port") is not None:
-            proxy_data["port"] = int(proxy_data["port"])
-
-            if not 1 <= proxy_data["port"] <= 65535:
-                raise InvalidDataTypeException("Invalid proxy port")
-
-        if proxy_data.get("asn") is not None:
-            proxy_data["asn"] = int(
-                re.sub(
-                    r"^AS",
-                    "",
-                    str(proxy_data["asn"]).strip(),
-                    flags=re.IGNORECASE,
-                )
-            )
-
-        if proxy_data.get("latency") is not None:
-            proxy_data["latency"] = float(proxy_data["latency"])
-
-        if proxy_data.get("protocol"):
-            protocol = str(proxy_data["protocol"]).strip().lower()
-
-            if protocol not in {
-                "http",
-                "https",
-                "socks4",
-                "socks5",
-                "socks4a",
-                "socks5h",
-            }:
-                proxy_data.pop("protocol", None)
-            else:
-                proxy_data["protocol"] = protocol
-
-        return Proxy(**proxy_data)
+        return proxies[0]
 
     def _collect_proxy(self, proxy):
         if self.stop_event.is_set():
