@@ -27,7 +27,7 @@ with io.open(os.path.join(here, "README.md"), encoding="utf-8") as f:
     long_description = "\n" + f.read()
 
 setup(
-    name="inproxy",
+    name="pyinproxy",
     version=get_version(),
     description="",
     long_description=long_description,
